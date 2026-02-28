@@ -9,6 +9,7 @@ import queue
 import argparse
 import torch
 import torch.multiprocessing as mp
+from tqdm import tqdm
 import numpy as np
 import pandas as pd
 import faiss
@@ -499,14 +500,18 @@ def main():
         p.start()
         workers.append(p)
 
+    total_requests = len(prompts)
+    all_latencies = []
+    with tqdm(total=total_requests, desc="Requests", unit="req") as pbar:
+        for _ in range(total_requests):
+            all_latencies.append(latency_queue.get())
+            pbar.update(1)
+
     for p in workers:
         p.join()
     scheduler.join()
 
     wall_total = time.time() - wall_start
-    all_latencies = []
-    while not latency_queue.empty():
-        all_latencies.append(latency_queue.get())
     print(f"[Total wall time] {wall_total:.2f}s")
     if all_latencies:
         print(
