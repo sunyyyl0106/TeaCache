@@ -45,9 +45,12 @@ def request_scheduler_video(
     log_file="request_throughput_video_teacache.csv",
     eval_mode=False,
     no_nirvana=False,
+    cache_stats=None,
 ):
     device = clip_model.device
     agg_k_distribution = {k: 0 for k in k_values}
+    if cache_stats is None:
+        cache_stats = {"hits": 0, "misses": 0}
     minute = 0
     os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
     with open(log_file, "w") as f:
@@ -102,6 +105,7 @@ def request_scheduler_video(
             row["k"] = None
             row["latent"] = None
             row["query_embedding"] = text_embedding.clone()
+            cache_stats["misses"] = cache_stats.get("misses", 0) + 1
             req_queue.put(row.to_dict())
             continue
 
@@ -121,6 +125,7 @@ def request_scheduler_video(
             row["k"] = None
             row["latent"] = None
             row["query_embedding"] = text_embedding.clone()
+            cache_stats["misses"] = cache_stats.get("misses", 0) + 1
             req_queue.put(row.to_dict())
         else:
             distances, indices = index.search(query_embedding, k=1)
@@ -160,6 +165,7 @@ def request_scheduler_video(
                     row["k"] = k_i
                     row["latent"] = latent.clone().to(dtype=torch.float32).cpu()
                     row["query_embedding"] = text_embedding.clone()
+                    cache_stats["hits"] = cache_stats.get("hits", 0) + 1
                     req_queue.put(row.to_dict())
                     agg_k_distribution[k_i] += 1
                 else:
@@ -167,12 +173,14 @@ def request_scheduler_video(
                     row["k"] = None
                     row["latent"] = None
                     row["query_embedding"] = text_embedding.clone()
+                    cache_stats["misses"] = cache_stats.get("misses", 0) + 1
                     req_queue.put(row.to_dict())
             else:
                 row["cached"] = None
                 row["k"] = None
                 row["latent"] = None
                 row["query_embedding"] = text_embedding.clone()
+                cache_stats["misses"] = cache_stats.get("misses", 0) + 1
                 req_queue.put(row.to_dict())
 
         request_count_per_min += 1
@@ -447,6 +455,9 @@ def main():
     latency_queue = mp.Queue()
     manager = mp.Manager()
     worker_status = manager.dict()
+    cache_stats = manager.dict()
+    cache_stats["hits"] = 0
+    cache_stats["misses"] = 0
 
     device = "cuda:0"
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
@@ -473,6 +484,7 @@ def main():
             "log_file": "request_throughput_video_teacache.csv",
             "eval_mode": args.eval_mode,
             "no_nirvana": args.no_nirvana,
+            "cache_stats": cache_stats,
         },
     )
     scheduler.start()
@@ -517,6 +529,14 @@ def main():
         print(
             f"[Per-request latency] min={min(all_latencies):.2f}s max={max(all_latencies):.2f}s avg={np.mean(all_latencies):.2f}s (n={len(all_latencies)})"
         )
+    hits = cache_stats.get("hits", 0)
+    misses = cache_stats.get("misses", 0)
+    total_cache_requests = hits + misses
+    if total_cache_requests > 0:
+        hit_rate_pct = 100.0 * hits / total_cache_requests
+        print(f"[Cache hit rate] {hits}/{total_cache_requests} = {hit_rate_pct:.1f}%")
+    elif args.no_nirvana:
+        print("[Cache hit rate] N/A (Nirvana disabled)")
 
 
 if __name__ == "__main__":
