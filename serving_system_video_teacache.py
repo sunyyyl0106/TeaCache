@@ -7,7 +7,6 @@ import re
 import time
 import queue
 import argparse
-import json
 import torch
 import torch.multiprocessing as mp
 import numpy as np
@@ -17,9 +16,10 @@ from transformers import CLIPModel, CLIPProcessor
 
 from serving_system_N import evict_from_faiss, KMinHeapCache
 
-# Video pipeline + TeaCache
+# Video pipeline + TeaCache (same as eval/teacache/experiments/opensora.py)
 from videosys import OpenSoraConfig, VideoSysEngine
 from eval.teacache.experiments.opensora import teacache_forward
+from eval.teacache.experiments.utils import read_prompt_list
 
 # Default generation params (fixed for cache compatibility)
 DEFAULT_RESOLUTION = "480p"
@@ -42,6 +42,8 @@ def request_scheduler_video(
     clip_model,
     worker_status,
     log_file="request_throughput_video_teacache.csv",
+    eval_mode=False,
+    no_nirvana=False,
 ):
     device = clip_model.device
     agg_k_distribution = {k: 0 for k in k_values}
@@ -54,8 +56,9 @@ def request_scheduler_video(
     size_of_queues = 0
 
     for _, row in selected_requests.iterrows():
-        while time.time() - start_time < row["seconds_from_start"]:
-            time.sleep(0.1)
+        if not eval_mode:
+            while time.time() - start_time < row["seconds_from_start"]:
+                time.sleep(0.1)
 
         request_arrival_time = time.time()
         row["start_time"] = request_arrival_time
@@ -83,6 +86,24 @@ def request_scheduler_video(
                 cache.insert(num_embeddings, 0, k, new_cached_latents[idx])
 
         prompt = row["prompt"]
+        if no_nirvana:
+            # No cache: every request does full generation (for A/B time comparison)
+            with torch.no_grad():
+                texts = processor(
+                    text=[prompt],
+                    return_tensors="pt",
+                    truncation=True,
+                    padding=True,
+                    max_length=77,
+                ).to(device)
+                text_embedding = clip_model.get_text_features(**texts).cpu()
+            row["cached"] = None
+            row["k"] = None
+            row["latent"] = None
+            row["query_embedding"] = text_embedding.clone()
+            req_queue.put(row.to_dict())
+            continue
+
         texts = processor(
             text=[prompt],
             return_tensors="pt",
@@ -211,6 +232,8 @@ def worker_video(
     aspect_ratio,
     num_frames,
     teacache_thresh,
+    loop=1,
+    no_nirvana=False,
 ):
     device = f"cuda:{gpu_id}"
     config = OpenSoraConfig(num_gpus=1, num_sampling_steps=30)
@@ -234,29 +257,31 @@ def worker_video(
             request = req_queue.get(timeout=10)
             idle_counter = 0
             prompt = request["prompt"]
-            clean_prompt = re.sub(r"[^\w\-_\.]", "_", prompt)[:200]
-            out_path = os.path.join(
-                video_directory, f"{clean_prompt}_{request.get('start_time', 0)}.mp4"
-            )
+            # Same naming as eval/teacache/experiments/utils.py: {prompt}-{l}.mp4
+            for l in range(loop):
+                out_path = os.path.join(video_directory, f"{prompt}-{l}.mp4")
 
-            if request["cached"] is None:
-                result = pipeline.generate(
-                    prompt,
-                    resolution=resolution,
-                    aspect_ratio=aspect_ratio,
-                    num_frames=num_frames,
-                    seed=42,
-                    verbose=False,
-                    collect_latents_at_steps=tuple(K_VALUES_VIDEO),
-                )
-                if isinstance(result, tuple):
-                    output, collected_latents = result
-                else:
-                    output = result
-                    collected_latents = None
-                video = output.video[0]
-                engine.save_video(video, out_path)
-                if collected_latents is not None and request.get("query_embedding") is not None:
+                use_cache = (l == 0)
+                if request["cached"] is None or not use_cache:
+                    # Full generation (cache miss or extra loop)
+                    collect_latents = tuple(K_VALUES_VIDEO) if (use_cache and request["cached"] is None) else None
+                    result = pipeline.generate(
+                        prompt,
+                        resolution=resolution,
+                        aspect_ratio=aspect_ratio,
+                        num_frames=num_frames,
+                        seed=l,
+                        verbose=False,
+                        collect_latents_at_steps=collect_latents,
+                    )
+                    if isinstance(result, tuple):
+                        output, collected_latents = result
+                    else:
+                        output = result
+                        collected_latents = None
+                    video = output.video[0]
+                    engine.save_video(video, out_path)
+                if not no_nirvana and collected_latents is not None and request.get("query_embedding") is not None:
                     cached_latents = [z.cpu() for z in collected_latents]
                     qe = request["query_embedding"]
                     qe_np = qe.numpy().reshape(1, -1) if hasattr(qe, "numpy") else np.array(qe).reshape(1, -1)
@@ -267,25 +292,26 @@ def worker_video(
                             "query_embedding": qe_np,
                         }
                     )
-            else:
-                cache_latent = request["latent"].unsqueeze(0)
-                k = request["k"]
-                result = pipeline.generate(
-                    prompt,
-                    resolution=resolution,
-                    aspect_ratio=aspect_ratio,
-                    num_frames=num_frames,
-                    seed=42,
-                    verbose=False,
-                    cache_latent=cache_latent,
-                    cache_start_step=k,
-                )
-                if isinstance(result, tuple):
-                    output = result[0]
                 else:
-                    output = result
-                video = output.video[0]
-                engine.save_video(video, out_path)
+                    # Cache hit, first loop only
+                    cache_latent = request["latent"].unsqueeze(0)
+                    k = request["k"]
+                    result = pipeline.generate(
+                        prompt,
+                        resolution=resolution,
+                        aspect_ratio=aspect_ratio,
+                        num_frames=num_frames,
+                        seed=l,
+                        verbose=False,
+                        cache_latent=cache_latent,
+                        cache_start_step=k,
+                    )
+                    if isinstance(result, tuple):
+                        output = result[0]
+                    else:
+                        output = result
+                    video = output.video[0]
+                    engine.save_video(video, out_path)
 
             finish_time = time.time() - request["start_time"]
             latency_queue.put(finish_time)
@@ -314,7 +340,12 @@ def main():
     parser = argparse.ArgumentParser(
         description="TeaCache video serving with Nirvana-style cross-request latent cache"
     )
-    parser.add_argument("--num_req", type=int, default=50, help="number of requests")
+    parser.add_argument(
+        "--num_req",
+        type=int,
+        default=None,
+        help="Max prompts to process (default: all when --prompt_list given, else 50)",
+    )
     parser.add_argument("--cache_size", type=int, default=1000, help="cache size (entries)")
     parser.add_argument(
         "--video_directory",
@@ -349,8 +380,24 @@ def main():
     parser.add_argument(
         "--teacache_thresh",
         type=float,
-        default=0.15,
-        help="TeaCache rel_l1_thresh (higher = more skip)",
+        default=0.2,
+        help="TeaCache rel_l1_thresh (same as opensora teacache_fast=0.2; higher = more skip)",
+    )
+    parser.add_argument(
+        "--loop",
+        type=int,
+        default=5,
+        help="Videos per prompt (same as opensora eval, default 5); only the first uses Nirvana cache",
+    )
+    parser.add_argument(
+        "--eval_mode",
+        action="store_true",
+        help="No request timing: submit all prompts at once and run as fast as possible (like opensora eval)",
+    )
+    parser.add_argument(
+        "--no_nirvana",
+        action="store_true",
+        help="Disable Nirvana cache: every request does full 30-step generation (for A/B time comparison)",
     )
     args = parser.parse_args()
 
@@ -359,21 +406,19 @@ def main():
     if num_gpus == 0:
         raise RuntimeError("No CUDA devices")
 
-    # Prompts
+    # Prompts (same as opensora: read_prompt_list uses prompt_en from JSON)
     if args.prompt_list and os.path.isfile(args.prompt_list):
-        with open(args.prompt_list, "r") as f:
-            data = json.load(f)
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            prompts = [d.get("prompt_en", d.get("prompt", str(d))) for d in data]
-        else:
-            prompts = [str(p) for p in data]
+        prompts = read_prompt_list(args.prompt_list)
+        if args.num_req is not None:
+            prompts = prompts[: args.num_req]
     else:
+        num_req = args.num_req if args.num_req is not None else 50
         prompts = [
             "A cat walking on the street.",
             "Ocean waves under sunset.",
             "A dog running in the park.",
-        ] * max(1, (args.num_req + 2) // 3)
-    prompts = prompts[: args.num_req]
+        ] * max(1, (num_req + 2) // 3)
+        prompts = prompts[:num_req]
 
     # Request schedule
     seconds_from_start = generate_rapidly_increasing_seconds_from_start(
@@ -406,13 +451,13 @@ def main():
     processor = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
     clip_model = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
 
-    start_time = time.time()
+    wall_start = time.time()
     scheduler = mp.Process(
         target=request_scheduler_video,
         args=(
             req_queue,
             selected_requests,
-            start_time,
+            wall_start,
             index,
             cache,
             new_cache_queue,
@@ -423,7 +468,11 @@ def main():
             clip_model,
             worker_status,
         ),
-        kwargs={"log_file": "request_throughput_video_teacache.csv"},
+        kwargs={
+            "log_file": "request_throughput_video_teacache.csv",
+            "eval_mode": args.eval_mode,
+            "no_nirvana": args.no_nirvana,
+        },
     )
     scheduler.start()
 
@@ -443,6 +492,8 @@ def main():
                 args.aspect_ratio,
                 args.num_frames,
                 args.teacache_thresh,
+                args.loop,
+                args.no_nirvana,
             ),
         )
         p.start()
@@ -452,12 +503,14 @@ def main():
         p.join()
     scheduler.join()
 
+    wall_total = time.time() - wall_start
     all_latencies = []
     while not latency_queue.empty():
         all_latencies.append(latency_queue.get())
+    print(f"[Total wall time] {wall_total:.2f}s")
     if all_latencies:
         print(
-            f"Latencies: min={min(all_latencies):.2f}s max={max(all_latencies):.2f}s avg={np.mean(all_latencies):.2f}s"
+            f"[Per-request latency] min={min(all_latencies):.2f}s max={max(all_latencies):.2f}s avg={np.mean(all_latencies):.2f}s (n={len(all_latencies)})"
         )
 
 
