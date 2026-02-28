@@ -1,3 +1,11 @@
+import os
+# experiment/opensora.py
+os.environ.setdefault("HF_HOME", "../../cache")
+os.environ.setdefault(
+    "HUGGINGFACE_HUB_CACHE",
+    "../../cache/hub",
+)
+
 from utils import generate_func, read_prompt_list
 from videosys import OpenSoraConfig, VideoSysEngine
 import torch
@@ -206,7 +214,7 @@ def teacache_forward(
 def eval_base(prompt_list):
     config = OpenSoraConfig()
     engine = VideoSysEngine(config)
-    generate_func(engine, prompt_list, "./samples/opensora_base", loop=5)
+    generate_func(engine, prompt_list, "./samples2/opensora_base", loop=5)
 
 def eval_teacache_slow(prompt_list):
     config = OpenSoraConfig()
