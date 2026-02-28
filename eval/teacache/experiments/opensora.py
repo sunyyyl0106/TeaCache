@@ -1,4 +1,12 @@
-from utils import generate_func, read_prompt_list
+import os
+# experiment/opensora.py
+os.environ.setdefault("HF_HOME", "./cache")
+os.environ.setdefault(
+    "HUGGINGFACE_HUB_CACHE",
+    "./cache/hub",
+)
+
+from .utils import generate_func, read_prompt_list
 from videosys import OpenSoraConfig, VideoSysEngine
 import torch
 from einops import rearrange

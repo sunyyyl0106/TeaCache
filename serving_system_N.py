@@ -3,8 +3,8 @@ import time
 import queue
 import torch.multiprocessing as mp
 import pandas as pd
-from diffusers import StableDiffusion3Pipeline, StableDiffusionXLImg2ImgPipeline, DiffusionPipeline, SanaPipeline, StableDiffusionXLPipeline
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler, FlowMatchEulerDiscreteScheduler
+# from diffusers import StableDiffusion3Pipeline, StableDiffusionXLImg2ImgPipeline, DiffusionPipeline, SanaPipeline, StableDiffusionXLPipeline
+# from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler, FlowMatchEulerDiscreteScheduler
 import faiss
 import os
 from transformers import CLIPModel, CLIPProcessor
@@ -17,17 +17,18 @@ import argparse
 import gc
 
 # Cache Data Structure
-parser = argparse.ArgumentParser(description="model selection")
-parser.add_argument("--large_model", type=str, default='sd3.5',required=False, help="which large model you wanna use")
-parser.add_argument("--small_model", type=str,default='sdxl', required=False, help="which small model you wanna use")
-parser.add_argument("--num_req", type=int, default=1000, required=True, help="number of requests")
-parser.add_argument("--cache_size", type=int, default=10000, help="cache size")
-parser.add_argument("--cache_directory", type=str, required=False, help="directory of cached images")
-parser.add_argument("--image_directory", type=str, required=False, help="directory of generated images")
-args = parser.parse_args()
-directory = args.image_directory
-os.makedirs(directory, exist_ok=True)
-print(f"Directory '{directory}' created successfully.")
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="model selection")
+    parser.add_argument("--large_model", type=str, default='sd3.5',required=False, help="which large model you wanna use")
+    parser.add_argument("--small_model", type=str,default='sdxl', required=False, help="which small model you wanna use")
+    parser.add_argument("--num_req", type=int, default=1000, required=True, help="number of requests")
+    parser.add_argument("--cache_size", type=int, default=10000, help="cache size")
+    parser.add_argument("--cache_directory", type=str, required=False, help="directory of cached images")
+    parser.add_argument("--image_directory", type=str, required=False, help="directory of generated images")
+    args = parser.parse_args()
+    directory = args.image_directory
+    os.makedirs(directory, exist_ok=True)
+    print(f"Directory '{directory}' created successfully.")
 
 def extract_prompt(filename):
     """Extract prompt from filename by replacing underscores with spaces."""
