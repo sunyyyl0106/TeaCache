@@ -8,7 +8,6 @@ import time
 import queue
 import argparse
 import torch
-from tqdm import tqdm
 import torch.multiprocessing as mp
 import numpy as np
 import pandas as pd
@@ -282,17 +281,17 @@ def worker_video(
                         collected_latents = None
                     video = output.video[0]
                     engine.save_video(video, out_path)
-                if not no_nirvana and collected_latents is not None and request.get("query_embedding") is not None:
-                    cached_latents = [z.cpu() for z in collected_latents]
-                    qe = request["query_embedding"]
-                    qe_np = qe.numpy().reshape(1, -1) if hasattr(qe, "numpy") else np.array(qe).reshape(1, -1)
-                    new_cache_queue.put(
-                        {
-                            "cached_latents": cached_latents,
-                            "prompt": prompt,
-                            "query_embedding": qe_np,
-                        }
-                    )
+                    if not no_nirvana and collected_latents is not None and request.get("query_embedding") is not None:
+                        cached_latents = [z.cpu() for z in collected_latents]
+                        qe = request["query_embedding"]
+                        qe_np = qe.numpy().reshape(1, -1) if hasattr(qe, "numpy") else np.array(qe).reshape(1, -1)
+                        new_cache_queue.put(
+                            {
+                                "cached_latents": cached_latents,
+                                "prompt": prompt,
+                                "query_embedding": qe_np,
+                            }
+                        )
                 else:
                     # Cache hit, first loop only
                     cache_latent = request["latent"].unsqueeze(0)
@@ -500,18 +499,14 @@ def main():
         p.start()
         workers.append(p)
 
-    total_requests = len(prompts)
-    all_latencies = []
-    with tqdm(total=total_requests, desc="Requests", unit="req") as pbar:
-        for _ in range(total_requests):
-            all_latencies.append(latency_queue.get())
-            pbar.update(1)
-
     for p in workers:
         p.join()
     scheduler.join()
 
     wall_total = time.time() - wall_start
+    all_latencies = []
+    while not latency_queue.empty():
+        all_latencies.append(latency_queue.get())
     print(f"[Total wall time] {wall_total:.2f}s")
     if all_latencies:
         print(
