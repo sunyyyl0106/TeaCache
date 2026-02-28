@@ -196,10 +196,18 @@ class RFLOW:
         guidance_scale=None,
         progress=True,
         verbose=False,
+        start_step=0,
+        initial_z=None,
+        latent_save_steps=None,
+        collected_latents=None,
     ):
         # if no specific guidance scale is provided, use the default scale when initializing the scheduler
         if guidance_scale is None:
             guidance_scale = self.cfg_scale
+
+        # start from cached latent if provided (Nirvana-style cross-request reuse)
+        if initial_z is not None and start_step > 0:
+            z = initial_z.to(device=device, dtype=z.dtype)
 
         # text encoding
         model_args["y"] = torch.cat([model_args["y"], y_null], 0)
@@ -215,12 +223,18 @@ class RFLOW:
         if mask is not None:
             noise_added = torch.zeros_like(mask, dtype=torch.bool)
             noise_added = noise_added | (mask == 1)
+            # when starting from cached latent, do not re-add noise on first iteration
+            if start_step > 0:
+                noise_added = noise_added | True
 
         progress_wrap = tqdm if progress and dist.get_rank() == 0 else (lambda x: x)
+        save_steps_set = set(latent_save_steps) if latent_save_steps else set()
 
         dtype = model.x_embedder.proj.weight.dtype
         all_timesteps = [int(t.to(dtype).item()) for t in timesteps]
         for i, t in progress_wrap(list(enumerate(timesteps))):
+            if i < start_step:
+                continue
             # mask for adding noise
             if mask is not None:
                 mask_t = mask * self.num_timesteps
@@ -252,6 +266,10 @@ class RFLOW:
 
             if mask is not None:
                 z = torch.where(mask_t_upper[:, None, :, None, None], z, x0)
+
+            # save latent at k steps for Nirvana-style cache (cross-request reuse)
+            if collected_latents is not None and save_steps_set and (i + 1) in save_steps_set:
+                collected_latents.append(z.chunk(2, dim=0)[0].clone())
 
         return z
 

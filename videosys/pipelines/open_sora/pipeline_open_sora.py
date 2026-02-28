@@ -444,6 +444,9 @@ class OpenSoraPipeline(VideoSysPipeline):
         condition_frame_edit: float = 0.0,
         return_dict: bool = True,
         verbose: bool = True,
+        cache_latent: Optional[torch.Tensor] = None,
+        cache_start_step: Optional[int] = None,
+        collect_latents_at_steps: Optional[Tuple[int, ...]] = None,
     ) -> Union[VideoSysPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
@@ -606,6 +609,7 @@ class OpenSoraPipeline(VideoSysPipeline):
 
         # == Iter over loop generation ==
         video_clips = []
+        collected_latents = [] if collect_latents_at_steps else None
         for loop_i in range(loop):
             # == get prompt for loop i ==
             batch_prompts_loop = extract_prompts_loop(batch_prompts, loop_i)
@@ -619,9 +623,14 @@ class OpenSoraPipeline(VideoSysPipeline):
             # == sampling ==
             input_size = (num_frames, *image_size)
             latent_size = self.vae.get_latent_size(input_size)
-            z = torch.randn(
-                len(batch_prompts), self.vae.out_channels, *latent_size, device=self._device, dtype=self._dtype
-            )
+            if cache_latent is not None and cache_start_step is not None and loop_i == 0:
+                z = cache_latent.to(device=self._device, dtype=self._dtype)
+                start_step = cache_start_step
+            else:
+                z = torch.randn(
+                    len(batch_prompts), self.vae.out_channels, *latent_size, device=self._device, dtype=self._dtype
+                )
+                start_step = 0
             model_args.update(self.encode_prompt(batch_prompts_loop))
             y_null = self.null_embed(len(batch_prompts_loop))
 
@@ -634,6 +643,10 @@ class OpenSoraPipeline(VideoSysPipeline):
                 device=self._device,
                 progress=verbose,
                 mask=masks,
+                start_step=start_step,
+                initial_z=cache_latent.to(device=self._device, dtype=self._dtype) if (cache_latent is not None and loop_i == 0) else None,
+                latent_save_steps=collect_latents_at_steps if loop_i == 0 else None,
+                collected_latents=collected_latents,
             )
             samples = self.vae(samples.to(self._dtype), decode_only=True, num_frames=num_frames)
             video_clips.append(samples)
@@ -651,8 +664,12 @@ class OpenSoraPipeline(VideoSysPipeline):
         self.maybe_free_model_hooks()
 
         if not return_dict:
+            if collect_latents_at_steps is not None:
+                return (video, collected_latents)
             return (video,)
 
+        if collect_latents_at_steps is not None:
+            return VideoSysPipelineOutput(video=video), collected_latents
         return VideoSysPipelineOutput(video=video)
 
     def save_video(self, video, output_path):
