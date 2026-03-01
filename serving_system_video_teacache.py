@@ -408,6 +408,12 @@ def main():
         action="store_true",
         help="Disable Nirvana cache: every request does full 30-step generation (for A/B time comparison)",
     )
+    parser.add_argument(
+        "--log_file",
+        type=str,
+        default="request_throughput_video_teacache_w_nirvana.csv",
+        help="log file path",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.video_directory, exist_ok=True)
@@ -481,7 +487,7 @@ def main():
             worker_status,
         ),
         kwargs={
-            "log_file": "request_throughput_video_teacache.csv",
+            "log_file": args.log_file,
             "eval_mode": args.eval_mode,
             "no_nirvana": args.no_nirvana,
             "cache_stats": cache_stats,
