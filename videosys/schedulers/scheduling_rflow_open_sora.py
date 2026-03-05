@@ -154,9 +154,10 @@ class RFlowScheduler:
         timepoints = 1 - timepoints  # [1,1/1000]
 
         # timepoint  (bsz) noise: (bsz, 4, frame, w ,h)
-        # expand timepoint to noise shape
-        timepoints = timepoints.unsqueeze(1).unsqueeze(1).unsqueeze(1).unsqueeze(1)
-        timepoints = timepoints.repeat(1, noise.shape[1], noise.shape[2], noise.shape[3], noise.shape[4])
+        # expand timepoint to match original_samples shape
+        while len(timepoints.shape) < len(original_samples.shape):
+            timepoints = timepoints.unsqueeze(-1)
+        timepoints = timepoints.expand_as(original_samples)
 
         return timepoints * original_samples + (1 - timepoints) * noise
 

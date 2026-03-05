@@ -83,10 +83,14 @@ def teacache_forward(
                 self.accumulated_rel_l1_distance = 0
             else:       
                 coefficients = [2.17546007e+02, -1.18329252e+02,  2.68662585e+01, -4.59364272e-02, 4.84426240e-02]
-                rescale_func = np.poly1d(coefficients) 
-                self.accumulated_rel_l1_distance +=  rescale_func(((modulated_inp-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item())
-                if self.accumulated_rel_l1_distance < self.rel_l1_thresh:
-                    should_calc = False
+                rescale_func = np.poly1d(coefficients)
+                if self.previous_modulated_input is not None:
+                    self.accumulated_rel_l1_distance +=  rescale_func(((modulated_inp-self.previous_modulated_input).abs().mean() / self.previous_modulated_input.abs().mean()).cpu().item())
+                    if self.accumulated_rel_l1_distance < self.rel_l1_thresh:
+                        should_calc = False
+                    else:
+                        should_calc = True
+                        self.accumulated_rel_l1_distance = 0
                 else:
                     should_calc = True
                     self.accumulated_rel_l1_distance = 0

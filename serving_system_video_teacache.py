@@ -303,7 +303,16 @@ def worker_video(
                         )
                 else:
                     # Cache hit, first loop only
-                    cache_latent = request["latent"].unsqueeze(0)
+                    cache_latent = request["latent"]
+                    # Normalize cached latent shape to [B, C, T, H, W].
+                    # Stored latents may already include batch dim (5D), and older entries can be 6D.
+                    if isinstance(cache_latent, torch.Tensor):
+                        if cache_latent.dim() == 4:
+                            cache_latent = cache_latent.unsqueeze(0)
+                        elif cache_latent.dim() == 6 and cache_latent.shape[0] == 1:
+                            cache_latent = cache_latent.squeeze(0)
+                        if cache_latent.dim() != 5:
+                            raise ValueError(f"Invalid cached latent shape: {tuple(cache_latent.shape)}")
                     k = request["k"]
                     result = pipeline.generate(
                         prompt,
