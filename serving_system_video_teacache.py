@@ -264,6 +264,7 @@ def worker_video(
     while True:
         try:
             request = req_queue.get(timeout=10)
+            process_start = time.time()
             idle_counter = 0
             prompt = request["prompt"]
             # Same naming as eval/teacache/experiments/utils.py: {prompt}-{l}.mp4
@@ -331,7 +332,8 @@ def worker_video(
                     engine.save_video(video, out_path)
 
             finish_time = time.time() - request["start_time"]
-            latency_queue.put(finish_time)
+            pure_processing_time = time.time() - process_start
+            latency_queue.put((finish_time, pure_processing_time))
 
         except queue.Empty:
             idle_counter += 1
@@ -528,9 +530,12 @@ def main():
 
     total_requests = len(prompts)
     all_latencies = []
+    all_processing_times = []
     with tqdm(total=total_requests, desc="Requests", unit="req") as pbar:
         for _ in range(total_requests):
-            all_latencies.append(latency_queue.get())
+            finish_time, pure_processing_time = latency_queue.get()
+            all_latencies.append(finish_time)
+            all_processing_times.append(pure_processing_time)
             pbar.update(1)
 
     for p in workers:
@@ -542,6 +547,10 @@ def main():
     if all_latencies:
         print(
             f"[Per-request latency] min={min(all_latencies):.2f}s max={max(all_latencies):.2f}s avg={np.mean(all_latencies):.2f}s (n={len(all_latencies)})"
+        )
+    if all_processing_times:
+        print(
+            f"[Pure processing time] min={min(all_processing_times):.2f}s max={max(all_processing_times):.2f}s avg={np.mean(all_processing_times):.2f}s (n={len(all_processing_times)})"
         )
     hits = cache_stats.get("hits", 0)
     misses = cache_stats.get("misses", 0)
