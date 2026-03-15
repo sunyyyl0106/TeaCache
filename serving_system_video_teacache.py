@@ -270,10 +270,9 @@ def worker_video(
             for l in range(loop):
                 out_path = os.path.join(video_directory, f"{prompt}-{l}.mp4")
 
-                use_cache = (l == 0)
-                if request["cached"] is None or not use_cache:
-                    # Full generation (cache miss or extra loop)
-                    collect_latents = tuple(K_VALUES_VIDEO) if (use_cache and request["cached"] is None) else None
+                if request["cached"] is None:
+                    # Full generation (cache miss); write cache only on first loop iteration
+                    collect_latents = tuple(K_VALUES_VIDEO) if (l == 0) else None
                     result = pipeline.generate(
                         prompt,
                         resolution=resolution,
@@ -302,7 +301,7 @@ def worker_video(
                             }
                         )
                 else:
-                    # Cache hit, first loop only
+                    # Nirvana hit: use same cached latent for every loop iteration, only seed differs
                     cache_latent = request["latent"]
                     # Normalize cached latent shape to [B, C, T, H, W].
                     # Stored latents may already include batch dim (5D), and older entries can be 6D.
