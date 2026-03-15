@@ -69,7 +69,7 @@ def request_scheduler_video(
 
         while not new_cache_queue.empty():
             cache_data = new_cache_queue.get()
-            new_cached_latents = cache_data["cached_latents"]
+            new_cached_latents = [z.clone() for z in cache_data["cached_latents"]]
             new_cached_prompt = cache_data["prompt"]
             new_query_embedding = cache_data["query_embedding"]
             while len(cache.item_map) + len(cache.k_values) > cache.max_size:
@@ -201,7 +201,7 @@ def request_scheduler_video(
     while not req_queue.empty():
         while not new_cache_queue.empty():
             cache_data = new_cache_queue.get()
-            new_cached_latents = cache_data["cached_latents"]
+            new_cached_latents = [z.clone() for z in cache_data["cached_latents"]]
             new_cached_prompt = cache_data["prompt"]
             new_query_embedding = cache_data["query_embedding"]
             while len(cache.item_map) + len(cache.k_values) > cache.max_size:
@@ -290,7 +290,7 @@ def worker_video(
                     video = output.video[0]
                     engine.save_video(video, out_path)
                     if not no_nirvana and collected_latents is not None and request.get("query_embedding") is not None:
-                        cached_latents = [z.cpu() for z in collected_latents]
+                        cached_latents = [z.cpu().clone() for z in collected_latents]
                         qe = request["query_embedding"]
                         qe_np = qe.numpy().reshape(1, -1) if hasattr(qe, "numpy") else np.array(qe).reshape(1, -1)
                         new_cache_queue.put(
