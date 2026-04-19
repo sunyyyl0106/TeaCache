@@ -449,14 +449,25 @@ def worker_video(
     teacache_forward = _load_teacache_forward()
 
     cfg   = WAN_CONFIGS[task]
-    model = wan.WanT2V(
-        config=cfg,
-        checkpoint_dir=ckpt_dir,
-        device_id=gpu_id,
-        rank=0,
-        t5_cpu=True,
-        offload_model=offload_model,
-    )
+    try:
+        model = wan.WanT2V(
+            config=cfg,
+            checkpoint_dir=ckpt_dir,
+            device_id=gpu_id,
+            rank=0,
+            t5_cpu=True,
+            offload_model=offload_model,
+        )
+    except TypeError as e:
+        if "offload_model" not in str(e):
+            raise
+        model = wan.WanT2V(
+            config=cfg,
+            checkpoint_dir=ckpt_dir,
+            device_id=gpu_id,
+            rank=0,
+            t5_cpu=True,
+        )
 
     # TeaCache patch (instance-level to avoid cross-worker state pollution).
     m        = model.model
