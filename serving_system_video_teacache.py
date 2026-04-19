@@ -1,31 +1,90 @@
 """
-Nirvana-style cross-request latent cache for TeaCache video (Open-Sora).
+Nirvana-style cross-request latent cache for TeaCache video (Wan2.1 T2V).
 Uses k_values = [5, 10, 15]; CLIP for prompt similarity; FAISS + KMinHeapCache.
+
+Usage:
+  python serving_system_video_teacache.py \
+      --ckpt_dir ./Wan2.1-T2V-14B \
+      --task t2v-14B \
+      --size 832*480 \
+      --num_req 100 \
+      --teacache_thresh 0.2
 """
+import gc
+import importlib.util
+import json
+import math
 import os
-import time
 import queue
+import sys
+import time
 import argparse
-import torch
-import torch.multiprocessing as mp
-from tqdm import tqdm
+from contextlib import contextmanager
+
+import faiss
 import numpy as np
 import pandas as pd
-import faiss
+import torch
+import torch.cuda.amp as amp
+import torch.multiprocessing as mp
+from tqdm import tqdm
 from transformers import CLIPModel, CLIPProcessor
+
+import wan
+from wan.configs import WAN_CONFIGS, SIZE_CONFIGS
+from wan.utils.utils import cache_video
+from wan.utils.fm_solvers import (
+    FlowDPMSolverMultistepScheduler,
+    get_sampling_sigmas,
+    retrieve_timesteps,
+)
+from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 from serving_system_N import evict_from_faiss, KMinHeapCache
 
-# Video pipeline + TeaCache (same as eval/teacache/experiments/opensora.py)
-from videosys import OpenSoraConfig, VideoSysEngine
-from eval.teacache.experiments.opensora import teacache_forward
-from eval.teacache.experiments.utils import read_prompt_list
+# ── generation defaults ───────────────────────────────────────────────────────
+DEFAULT_TASK           = "t2v-14B"
+DEFAULT_SIZE           = "832*480"
+DEFAULT_FRAME_NUM      = 81          # must be 4n+1
+DEFAULT_SAMPLING_STEPS = 50
+DEFAULT_GUIDE_SCALE    = 5.0
+DEFAULT_SHIFT          = 5.0
+K_VALUES_VIDEO         = [5, 10, 15]
 
-# Default generation params (fixed for cache compatibility)
-DEFAULT_RESOLUTION = "480p"
-DEFAULT_ASPECT_RATIO = "9:16"
-DEFAULT_NUM_FRAMES = 51
-K_VALUES_VIDEO = [5, 10, 15]
+# TeaCache polynomial coefficients (from TeaCache4Wan2.1/teacache_generate.py)
+_COEFFS = {
+    "1.3B": {
+        True:  [-5.21862437e+04,  9.23041404e+03, -5.28275948e+02,  1.36987616e+01, -4.99875664e-02],
+        False: [ 2.39676752e+03, -1.31110545e+03,  2.01331979e+02, -8.29855975e+00,  1.37887774e-01],
+    },
+    "14B": {
+        True:  [-3.03318725e+05,  4.90537029e+04, -2.65530556e+03,  5.87365115e+01, -3.15583525e-01],
+        False: [-5784.54975374,   5449.50911966,  -1811.16591783,    256.27178429,   -13.02252404],
+    },
+}
+
+
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _load_teacache_forward():
+    """Load teacache_forward from TeaCache4Wan2.1/ via importlib.
+    The directory name contains '.' so normal package import fails."""
+    path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "TeaCache4Wan2.1",
+        "teacache_generate.py",
+    )
+    spec = importlib.util.spec_from_file_location("teacache_wan21", path)
+    mod  = importlib.util.module_from_spec(spec)
+    sys.modules["teacache_wan21"] = mod
+    spec.loader.exec_module(mod)
+    return mod.teacache_forward
+
+
+def read_prompt_list(path):
+    with open(path) as f:
+        data = json.load(f)
+    return [item["prompt_en"] for item in data]
 
 
 def _drain_new_cache_queue(
@@ -35,14 +94,12 @@ def _drain_new_cache_queue(
 
     Normalizes embeddings for IndexFlatIP, evicts if needed, and remaps
     KMinHeapCache indices to stay aligned with the FAISS index after eviction.
-
-    Returns updated (index, final_text_embeddings).
     """
     while not new_cache_queue.empty():
-        cache_data = new_cache_queue.get()
+        cache_data         = new_cache_queue.get()
         new_cached_latents = [z.clone() for z in cache_data["cached_latents"]]
-        new_cached_prompt = cache_data["prompt"]
-        new_query_embedding = cache_data["query_embedding"]
+        new_cached_prompt  = cache_data["prompt"]
+        new_query_emb      = cache_data["query_embedding"]
 
         while len(cache.item_map) + len(cache.k_values) > cache.max_size:
             evicted_index = cache.evict()
@@ -54,19 +111,167 @@ def _drain_new_cache_queue(
                 cache.remap_index_after_eviction(evicted_index)
 
         # Normalize before inserting into IndexFlatIP so inner-product == cosine.
-        normalized_embedding = new_query_embedding.copy()
-        faiss.normalize_L2(normalized_embedding)
+        normalized_emb = new_query_emb.copy()
+        faiss.normalize_L2(normalized_emb)
 
         num_embeddings = index.ntotal
         cached_requests.append(new_cached_prompt)
-        index.add(normalized_embedding)
+        index.add(normalized_emb)
         final_text_embeddings = np.concatenate(
-            (final_text_embeddings, normalized_embedding), axis=0
+            (final_text_embeddings, normalized_emb), axis=0
         )
-        for idx, k in enumerate(k_values):
-            cache.insert(num_embeddings, 0, k, new_cached_latents[idx])
+        for _idx, k in enumerate(k_values):
+            cache.insert(num_embeddings, 0, k, new_cached_latents[_idx])
 
     return index, final_text_embeddings
+
+
+# ── Wan2.1 generate with Nirvana latent-cache support ────────────────────────
+
+def t2v_generate_nirvana(
+    self,
+    input_prompt,
+    size=(1280, 720),
+    frame_num=81,
+    shift=5.0,
+    sample_solver="unipc",
+    sampling_steps=50,
+    guide_scale=5.0,
+    n_prompt="",
+    seed=-1,
+    offload_model=True,
+    collect_latents_at_steps=None,
+    cache_latent=None,
+    cache_start_step=None,
+):
+    """Wan2.1 T2V generate patched for Nirvana cross-request caching.
+
+    collect_latents_at_steps:
+        Tuple of 1-based step numbers at which to snapshot the intermediate
+        latent (e.g. (5, 10, 15)).  Used on cache-miss to populate the cache.
+    cache_latent / cache_start_step:
+        On a Nirvana hit, inject the cached latent and skip the first
+        cache_start_step denoising steps.
+    """
+    import random as _random
+    F = frame_num
+    target_shape = (
+        self.vae.model.z_dim,
+        (F - 1) // self.vae_stride[0] + 1,
+        size[1] // self.vae_stride[1],
+        size[0] // self.vae_stride[2],
+    )
+    seq_len = (
+        math.ceil(
+            (target_shape[2] * target_shape[3])
+            / (self.patch_size[1] * self.patch_size[2])
+            * target_shape[1]
+            / self.sp_size
+        )
+        * self.sp_size
+    )
+
+    if n_prompt == "":
+        n_prompt = self.sample_neg_prompt
+    seed = seed if seed >= 0 else _random.randint(0, sys.maxsize)
+    seed_g = torch.Generator(device=self.device)
+    seed_g.manual_seed(seed)
+
+    if not self.t5_cpu:
+        self.text_encoder.model.to(self.device)
+        context      = self.text_encoder([input_prompt], self.device)
+        context_null = self.text_encoder([n_prompt],     self.device)
+        if offload_model:
+            self.text_encoder.model.cpu()
+    else:
+        context      = self.text_encoder([input_prompt], torch.device("cpu"))
+        context_null = self.text_encoder([n_prompt],     torch.device("cpu"))
+        context      = [t.to(self.device) for t in context]
+        context_null = [t.to(self.device) for t in context_null]
+
+    noise = [
+        torch.randn(
+            *target_shape, dtype=torch.float32,
+            device=self.device, generator=seed_g,
+        )
+    ]
+
+    @contextmanager
+    def noop_no_sync():
+        yield
+
+    no_sync = getattr(self.model, "no_sync", noop_no_sync)
+
+    with amp.autocast(dtype=self.param_dtype), torch.no_grad(), no_sync():
+        if sample_solver == "unipc":
+            scheduler = FlowUniPCMultistepScheduler(
+                num_train_timesteps=self.num_train_timesteps,
+                shift=1, use_dynamic_shifting=False,
+            )
+            scheduler.set_timesteps(sampling_steps, device=self.device, shift=shift)
+            timesteps = scheduler.timesteps
+        elif sample_solver == "dpm++":
+            scheduler = FlowDPMSolverMultistepScheduler(
+                num_train_timesteps=self.num_train_timesteps,
+                shift=1, use_dynamic_shifting=False,
+            )
+            sigmas = get_sampling_sigmas(sampling_steps, shift)
+            timesteps, _ = retrieve_timesteps(scheduler, device=self.device, sigmas=sigmas)
+        else:
+            raise NotImplementedError(f"Unsupported solver: {sample_solver}")
+
+        # Nirvana: inject cached latent and trim already-completed steps.
+        if cache_latent is not None and cache_start_step is not None:
+            latents      = [cache_latent.to(self.device, dtype=torch.float32)]
+            timesteps    = timesteps[cache_start_step:]
+            start_offset = cache_start_step
+        else:
+            latents      = noise
+            start_offset = 0
+
+        collected = {}
+        arg_c    = {"context": context,      "seq_len": seq_len}
+        arg_null = {"context": context_null, "seq_len": seq_len}
+
+        self.model.to(self.device)
+        for step_idx, t in enumerate(tqdm(timesteps, leave=False)):
+            ts = torch.stack([t])
+            noise_pred_cond   = self.model(latents, t=ts, **arg_c)[0]
+            noise_pred_uncond = self.model(latents, t=ts, **arg_null)[0]
+            noise_pred = noise_pred_uncond + guide_scale * (
+                noise_pred_cond - noise_pred_uncond
+            )
+            temp_x0 = scheduler.step(
+                noise_pred.unsqueeze(0), t, latents[0].unsqueeze(0),
+                return_dict=False, generator=seed_g,
+            )[0]
+            latents = [temp_x0.squeeze(0)]
+
+            # Snapshot at 1-based global step number for Nirvana cache.
+            global_step = step_idx + start_offset + 1
+            if collect_latents_at_steps and global_step in collect_latents_at_steps:
+                collected[global_step] = latents[0].clone().cpu()
+
+        x0 = latents
+        if offload_model:
+            self.model.cpu()
+            torch.cuda.empty_cache()
+        if self.rank == 0:
+            videos = self.vae.decode(x0)
+
+    del noise, latents
+    del scheduler
+    if offload_model:
+        gc.collect()
+        torch.cuda.synchronize()
+
+    video = videos[0] if self.rank == 0 else None
+    if collect_latents_at_steps:
+        return video, [collected[k] for k in collect_latents_at_steps if k in collected]
+    return video
+
+
+# ── scheduler ─────────────────────────────────────────────────────────────────
 
 def request_scheduler_video(
     req_queue,
@@ -92,6 +297,7 @@ def request_scheduler_video(
     processor  = CLIPProcessor.from_pretrained(clip_model_name)
     clip_model = CLIPModel.from_pretrained(clip_model_name).to(clip_device)
     device = clip_device
+
     agg_k_distribution = {k: 0 for k in k_values}
     if cache_stats is None:
         cache_stats = {"hits": 0, "misses": 0}
@@ -108,11 +314,8 @@ def request_scheduler_video(
             while time.time() - start_time < row["seconds_from_start"]:
                 time.sleep(0.1)
 
-        request_arrival_time = time.time()
-        row["start_time"] = request_arrival_time
+        row["start_time"] = time.time()
 
-        # Bug 2 fix: use helper that also calls remap_index_after_eviction
-        # Bug 4 fix: helper normalizes embeddings for IndexFlatIP
         index, final_text_embeddings = _drain_new_cache_queue(
             new_cache_queue, cache, cached_requests, index, final_text_embeddings, k_values
         )
@@ -121,82 +324,70 @@ def request_scheduler_video(
         if no_nirvana:
             with torch.no_grad():
                 texts = processor(
-                    text=[prompt],
-                    return_tensors="pt",
-                    truncation=True,
-                    padding=True,
-                    max_length=77,
+                    text=[prompt], return_tensors="pt",
+                    truncation=True, padding=True, max_length=77,
                 ).to(device)
                 text_embedding = clip_model.get_text_features(**texts).cpu()
-            row["cached"] = None
-            row["k"] = None
-            row["latent"] = None
+            row["cached"]          = None
+            row["k"]               = None
+            row["latent"]          = None
             row["query_embedding"] = text_embedding.clone()
-            cache_stats["misses"] = cache_stats.get("misses", 0) + 1
+            cache_stats["misses"]  = cache_stats.get("misses", 0) + 1
             req_queue.put(row.to_dict())
+            request_count_per_min += 1
             continue
 
         texts = processor(
-            text=[prompt],
-            return_tensors="pt",
-            truncation=True,
-            padding=True,
-            max_length=77,
+            text=[prompt], return_tensors="pt",
+            truncation=True, padding=True, max_length=77,
         ).to(device)
         with torch.no_grad():
             text_embedding = clip_model.get_text_features(**texts).cpu()
 
-        # Bug 4 fix: normalize query before searching IndexFlatIP;
-        # inner-product on unit vectors == cosine similarity, eliminating the
-        # redundant second CLIP call that was needed with IndexFlatL2.
+        # Normalize for IndexFlatIP: inner-product on unit vectors == cosine.
         query_embedding = text_embedding.numpy().reshape(1, -1).copy()
         faiss.normalize_L2(query_embedding)
 
         if index.ntotal == 0:
-            row["cached"] = None
-            row["k"] = None
-            row["latent"] = None
+            row["cached"]          = None
+            row["k"]               = None
+            row["latent"]          = None
             row["query_embedding"] = text_embedding.clone()
-            cache_stats["misses"] = cache_stats.get("misses", 0) + 1
+            cache_stats["misses"]  = cache_stats.get("misses", 0) + 1
             req_queue.put(row.to_dict())
         else:
             distances, indices = index.search(query_embedding, k=1)
-            # With IndexFlatIP + L2-normalized vectors the distance IS cosine similarity.
-            text_similarity = float(distances[0][0])
+            sim = float(distances[0][0])
 
-            if text_similarity > 0.65:
-                # Opt 2: finer-grained k mapping across the full (0.65, 1.0] range
-                if text_similarity > 0.95:
-                    closest_index = 15
-                elif text_similarity > 0.85:
-                    closest_index = 10
-                elif text_similarity > 0.75:
-                    closest_index = 10
-                else:
-                    closest_index = 5
+            if sim > 0.65:
+                if   sim > 0.95: closest_index = 15
+                elif sim > 0.85: closest_index = 10
+                elif sim > 0.75: closest_index = 10
+                else:            closest_index = 5
+
                 best_candidate = cache.retrieve(closest_index, indices[0][0])
                 if best_candidate:
-                    score, (idex, k_i, latent) = best_candidate
-                    row["cached"] = True
-                    row["k"] = k_i
-                    row["latent"] = latent.clone().to(dtype=torch.float32).cpu()
+                    _score, (_idx, k_i, latent) = best_candidate
+                    row["cached"]          = True
+                    row["k"]               = k_i
+                    row["latent"]          = latent.clone().to(dtype=torch.float32).cpu()
                     row["query_embedding"] = text_embedding.clone()
-                    cache_stats["hits"] = cache_stats.get("hits", 0) + 1
+                    cache_stats["hits"]    = cache_stats.get("hits", 0) + 1
                     req_queue.put(row.to_dict())
                     agg_k_distribution[k_i] += 1
                 else:
-                    row["cached"] = None
-                    row["k"] = None
-                    row["latent"] = None
+                    row["cached"]          = None
+                    row["k"]               = None
+                    row["latent"]          = None
                     row["query_embedding"] = text_embedding.clone()
-                    cache_stats["misses"] = cache_stats.get("misses", 0) + 1
+                    cache_stats["misses"]  = cache_stats.get("misses", 0) + 1
                     req_queue.put(row.to_dict())
             else:
-                row["cached"] = None
-                row["k"] = None
-                row["latent"] = None
+                row["cached"]          = None
+                row["k"]               = None
+                row["latent"]          = None
                 row["query_embedding"] = text_embedding.clone()
-                cache_stats["misses"] = cache_stats.get("misses", 0) + 1
+                cache_stats["misses"]  = cache_stats.get("misses", 0) + 1
                 req_queue.put(row.to_dict())
 
         request_count_per_min += 1
@@ -204,40 +395,35 @@ def request_scheduler_video(
         if current_time - last_check_time_queue >= 60:
             elapsed_time = current_time - last_check_time_queue
             minute += 1
-            new_size_of_queues = req_queue.qsize()
-            throughput = size_of_queues + request_count_per_min - new_size_of_queues
-            size_of_queues = new_size_of_queues
+            new_size = req_queue.qsize()
+            throughput = size_of_queues + request_count_per_min - new_size
+            size_of_queues = new_size
             with open(log_file, "a") as f:
                 f.write(
-                    f"{minute},{request_count_per_min / elapsed_time * 60},{throughput / elapsed_time * 60}\n"
+                    f"{minute},"
+                    f"{request_count_per_min / elapsed_time * 60},"
+                    f"{throughput / elapsed_time * 60}\n"
                 )
             request_count_per_min = 0
             last_check_time_queue = current_time
 
-    # Drain any remaining cache updates while workers finish their last requests.
-    # Bug D fix: sleep to avoid busy-spinning when both queues are temporarily empty.
     while not req_queue.empty():
         index, final_text_embeddings = _drain_new_cache_queue(
             new_cache_queue, cache, cached_requests, index, final_text_embeddings, k_values
         )
         time.sleep(0.05)
 
-    # Bug F fix: log k distribution so cache skipping behaviour is observable.
     print(f"[Scheduler] k distribution: {agg_k_distribution}")
-
-    # Bug 3 fix: signal workers that no more requests are coming so they can
-    # exit cleanly as "finished" rather than waiting ~1000 s for idle timeout.
     done_event.set()
 
     while True:
         if req_queue.empty():
-            all_done = all(
-                status in ["finished", "dropped"] for status in worker_status.values()
-            )
-            if all_done:
+            if all(s in ("finished", "dropped") for s in worker_status.values()):
                 break
         time.sleep(1)
 
+
+# ── worker ────────────────────────────────────────────────────────────────────
 
 def worker_video(
     gpu_id,
@@ -246,118 +432,150 @@ def worker_video(
     latency_queue,
     worker_status,
     video_directory,
-    resolution,
-    aspect_ratio,
-    num_frames,
+    ckpt_dir,
+    task,
+    size,
+    frame_num,
+    sampling_steps,
+    guide_scale,
+    shift,
     teacache_thresh,
     done_event,
     loop=1,
     no_nirvana=False,
+    offload_model=True,
+    use_ret_steps=False,
 ):
-    device = f"cuda:{gpu_id}"
-    config = OpenSoraConfig(num_gpus=1, num_sampling_steps=30)
-    engine = VideoSysEngine(config)
+    teacache_forward = _load_teacache_forward()
 
-    # Bug 1 fix: set TeaCache state on the instance, not the class, so multiple
-    # workers don't overwrite each other's accumulated_rel_l1_distance etc.
-    trans = engine.driver_worker.transformer
-    trans.enable_teacache = True
-    trans.rel_l1_thresh = teacache_thresh
-    trans.accumulated_rel_l1_distance = 0
-    trans.previous_modulated_input = None
-    trans.previous_residual = None
-    trans.__class__.forward = teacache_forward  # method binding must stay on class
+    cfg   = WAN_CONFIGS[task]
+    model = wan.WanT2V(
+        config=cfg,
+        checkpoint_dir=ckpt_dir,
+        device_id=gpu_id,
+        rank=0,
+        t5_cpu=True,
+        offload_model=offload_model,
+    )
 
-    pipeline = engine.driver_worker
+    # TeaCache patch (instance-level to avoid cross-worker state pollution).
+    m        = model.model
+    size_key = "1.3B" if "1.3B" in task else "14B"
+    coeffs   = _COEFFS[size_key][use_ret_steps]
+
+    m.enable_teacache                  = True
+    m.cnt                              = 0
+    m.num_steps                        = sampling_steps * 2   # cond + uncond per step
+    m.teacache_thresh                  = teacache_thresh
+    m.accumulated_rel_l1_distance_even = 0
+    m.accumulated_rel_l1_distance_odd  = 0
+    m.previous_e0_even                 = None
+    m.previous_e0_odd                  = None
+    m.previous_residual_even           = None
+    m.previous_residual_odd            = None
+    m.use_ref_steps                    = use_ret_steps
+    m.coefficients                     = coeffs
+    m.ret_steps                        = (5 if use_ret_steps else 1) * 2
+    m.cutoff_steps                     = sampling_steps * 2 - (0 if use_ret_steps else 2)
+    m.__class__.forward                = teacache_forward
+
+    # Replace generate with the Nirvana-aware version.
+    model.__class__.generate = t2v_generate_nirvana
+
+    video_size   = SIZE_CONFIGS[size]
     idle_counter = 0
-    max_idle_iterations = 100
 
     while True:
         try:
-            request = req_queue.get(timeout=10)
+            request       = req_queue.get(timeout=10)
             process_start = time.time()
-            idle_counter = 0
-            prompt = request["prompt"]
-            # Same naming as eval/teacache/experiments/utils.py: {prompt}-{loop_idx}.mp4
-            for loop_idx in range(loop):  # Opt 3: renamed l → loop_idx (l/1 ambiguity)
+            idle_counter  = 0
+            prompt        = request["prompt"]
+
+            for loop_idx in range(loop):
                 out_path = os.path.join(video_directory, f"{prompt}-{loop_idx}.mp4")
 
                 if request["cached"] is None:
-                    # Full generation (cache miss); collect latents only on first iteration
-                    collect_latents = tuple(K_VALUES_VIDEO) if (loop_idx == 0) else None
-                    result = pipeline.generate(
+                    # Cache miss: full generation, snapshot latents on first loop.
+                    collect_steps = tuple(K_VALUES_VIDEO) if loop_idx == 0 else None
+                    result = model.generate(
                         prompt,
-                        resolution=resolution,
-                        aspect_ratio=aspect_ratio,
-                        num_frames=num_frames,
+                        size=video_size,
+                        frame_num=frame_num,
+                        shift=shift,
+                        sampling_steps=sampling_steps,
+                        guide_scale=guide_scale,
                         seed=loop_idx,
-                        verbose=False,
-                        collect_latents_at_steps=collect_latents,
+                        offload_model=offload_model,
+                        collect_latents_at_steps=collect_steps,
                     )
                     if isinstance(result, tuple):
-                        output, collected_latents = result
+                        video, collected_latents = result
                     else:
-                        output = result
-                        collected_latents = None
-                    video = output.video[0]
-                    engine.save_video(video, out_path)
-                    if not no_nirvana and collected_latents is not None and request.get("query_embedding") is not None:
-                        cached_latents = [z.cpu().clone() for z in collected_latents]
-                        qe = request["query_embedding"]
-                        qe_np = qe.numpy().reshape(1, -1) if hasattr(qe, "numpy") else np.array(qe).reshape(1, -1)
-                        new_cache_queue.put(
-                            {
-                                "cached_latents": cached_latents,
-                                "prompt": prompt,
-                                "query_embedding": qe_np,
-                            }
+                        video, collected_latents = result, None
+
+                    if video is not None:
+                        cache_video(
+                            tensor=video[None], save_file=out_path,
+                            fps=cfg.sample_fps, nrow=1,
+                            normalize=True, value_range=(-1, 1),
                         )
+                    if (not no_nirvana
+                            and collected_latents
+                            and request.get("query_embedding") is not None):
+                        qe    = request["query_embedding"]
+                        qe_np = (qe.numpy().reshape(1, -1)
+                                 if hasattr(qe, "numpy")
+                                 else np.array(qe).reshape(1, -1))
+                        new_cache_queue.put({
+                            "cached_latents": [z.cpu().clone() for z in collected_latents],
+                            "prompt":          prompt,
+                            "query_embedding": qe_np,
+                        })
+
                 else:
-                    # Nirvana hit: use cached latent, only seed differs per loop iteration
+                    # Cache hit: resume from cached latent.
                     cache_latent = request["latent"]
-                    # Normalize cached latent shape to [B, C, T, H, W].
-                    # Stored latents may already include batch dim (5D), older entries can be 6D.
                     if isinstance(cache_latent, torch.Tensor):
-                        if cache_latent.dim() == 4:
-                            cache_latent = cache_latent.unsqueeze(0)
-                        elif cache_latent.dim() == 6 and cache_latent.shape[0] == 1:
-                            cache_latent = cache_latent.squeeze(0)
-                        if cache_latent.dim() != 5:
-                            raise ValueError(f"Invalid cached latent shape: {tuple(cache_latent.shape)}")
+                        cache_latent = cache_latent.to(dtype=torch.float32)
                     k = request["k"]
-                    result = pipeline.generate(
+                    result = model.generate(
                         prompt,
-                        resolution=resolution,
-                        aspect_ratio=aspect_ratio,
-                        num_frames=num_frames,
+                        size=video_size,
+                        frame_num=frame_num,
+                        shift=shift,
+                        sampling_steps=sampling_steps,
+                        guide_scale=guide_scale,
                         seed=loop_idx,
-                        verbose=False,
+                        offload_model=offload_model,
                         cache_latent=cache_latent,
                         cache_start_step=k,
                     )
-                    if isinstance(result, tuple):
-                        output = result[0]
-                    else:
-                        output = result
-                    video = output.video[0]
-                    engine.save_video(video, out_path)
+                    video = result[0] if isinstance(result, tuple) else result
+                    if video is not None:
+                        cache_video(
+                            tensor=video[None], save_file=out_path,
+                            fps=cfg.sample_fps, nrow=1,
+                            normalize=True, value_range=(-1, 1),
+                        )
 
-            finish_time = time.time() - request["start_time"]
-            pure_processing_time = time.time() - process_start
-            latency_queue.put((finish_time, pure_processing_time))
+            latency_queue.put((
+                time.time() - request["start_time"],
+                time.time() - process_start,
+            ))
 
         except queue.Empty:
-            # Bug 3 fix: exit cleanly as "finished" once the scheduler signals
-            # no more requests, rather than waiting ~1000 s for idle timeout.
             if done_event.is_set():
                 worker_status[gpu_id] = "finished"
                 break
             idle_counter += 1
-            if idle_counter >= max_idle_iterations:
+            if idle_counter >= 100:
                 worker_status[gpu_id] = "dropped"
                 break
             continue
 
+
+# ── request timing ────────────────────────────────────────────────────────────
 
 def generate_rapidly_increasing_seconds_from_start(
     num_requests, min_rate=2, max_rate=9, duration=100 * 60
@@ -365,111 +583,80 @@ def generate_rapidly_increasing_seconds_from_start(
     min_rate_per_sec = min_rate / 60
     max_rate_per_sec = max_rate / 60
     x = np.linspace(-2, 6, num_requests)
-    sigmoid_growth = 1 / (1 + np.exp(-1.5 * x))
-    request_rates = min_rate_per_sec + (max_rate_per_sec - min_rate_per_sec) * sigmoid_growth
-    interarrival_times = 1 / np.maximum(request_rates, 1e-3)
-    return np.cumsum(interarrival_times)
+    sigmoid_growth  = 1 / (1 + np.exp(-1.5 * x))
+    request_rates   = min_rate_per_sec + (max_rate_per_sec - min_rate_per_sec) * sigmoid_growth
+    interarrival    = 1 / np.maximum(request_rates, 1e-3)
+    return np.cumsum(interarrival)
 
+
+# ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="TeaCache video serving with Nirvana-style cross-request latent cache"
+        description="TeaCache + Nirvana serving with Wan2.1 T2V"
     )
-    parser.add_argument(
-        "--num_req",
-        type=int,
-        default=None,
-        help="Max prompts to process (default: all when --prompt_list given, else 50)",
-    )
-    parser.add_argument("--cache_size", type=int, default=1000, help="cache size (entries)")
-    parser.add_argument(
-        "--video_directory",
-        type=str,
-        default="./video_outputs_teacache",
-        help="directory for generated videos",
-    )
-    parser.add_argument(
-        "--prompt_list",
-        type=str,
-        default=None,
-        help="JSON file with list of prompts (e.g. VBench_full_info.json); each item can have 'prompt_en'",
-    )
-    parser.add_argument(
-        "--resolution",
-        type=str,
-        default=DEFAULT_RESOLUTION,
-        help="resolution (e.g. 480p)",
-    )
-    parser.add_argument(
-        "--aspect_ratio",
-        type=str,
-        default=DEFAULT_ASPECT_RATIO,
-        help="aspect ratio (e.g. 9:16)",
-    )
-    parser.add_argument(
-        "--num_frames",
-        type=int,
-        default=DEFAULT_NUM_FRAMES,
-        help="number of frames",
-    )
-    parser.add_argument(
-        "--teacache_thresh",
-        type=float,
-        default=0.2,
-        help="TeaCache rel_l1_thresh (same as opensora teacache_fast=0.2; higher = more skip)",
-    )
-    parser.add_argument(
-        "--loop",
-        type=int,
-        default=5,
-        help="Videos per prompt (same as opensora eval, default 5); only the first uses Nirvana cache",
-    )
-    parser.add_argument(
-        "--eval_mode",
-        action="store_true",
-        help="No request timing: submit all prompts at once and run as fast as possible (like opensora eval)",
-    )
-    parser.add_argument(
-        "--no_nirvana",
-        action="store_true",
-        help="Disable Nirvana cache: every request does full 30-step generation (for A/B time comparison)",
-    )
-    parser.add_argument(
-        "--log_file",
-        type=str,
-        default="request_throughput_video_teacache_w_nirvana.csv",
-        help="log file path",
-    )
-    parser.add_argument(
-        "--num_workers",
-        type=int,
-        default=None,
-        help="Max number of worker processes (default: all GPUs). Use 1 for fair Nirvana vs no-Nirvana comparison to avoid GPU contention.",
-    )
+    parser.add_argument("--ckpt_dir", type=str, required=True,
+                        help="Wan2.1 checkpoint directory (e.g. ./Wan2.1-T2V-14B)")
+    parser.add_argument("--task", type=str, default=DEFAULT_TASK,
+                        choices=list(WAN_CONFIGS.keys()),
+                        help=f"Wan2.1 task (default: {DEFAULT_TASK})")
+    parser.add_argument("--size", type=str, default=DEFAULT_SIZE,
+                        choices=list(SIZE_CONFIGS.keys()),
+                        help=f"Output resolution WxH (default: {DEFAULT_SIZE})")
+    parser.add_argument("--frame_num", type=int, default=DEFAULT_FRAME_NUM,
+                        help=f"Frames per video, must be 4n+1 (default: {DEFAULT_FRAME_NUM})")
+    parser.add_argument("--sampling_steps", type=int, default=DEFAULT_SAMPLING_STEPS,
+                        help=f"Diffusion steps (default: {DEFAULT_SAMPLING_STEPS})")
+    parser.add_argument("--guide_scale", type=float, default=DEFAULT_GUIDE_SCALE,
+                        help=f"CFG scale (default: {DEFAULT_GUIDE_SCALE})")
+    parser.add_argument("--shift", type=float, default=DEFAULT_SHIFT,
+                        help=f"Flow-matching shift (default: {DEFAULT_SHIFT})")
+    parser.add_argument("--use_ret_steps", action="store_true",
+                        help="Use retention steps (better quality, slightly slower TeaCache)")
+    parser.add_argument("--offload_model", action="store_true", default=True,
+                        help="Offload model to CPU between steps to save VRAM")
+    parser.add_argument("--num_req", type=int, default=None,
+                        help="Max prompts (default: all from --prompt_list, else 50)")
+    parser.add_argument("--cache_size", type=int, default=1000,
+                        help="Nirvana cache size in entries (default: 1000)")
+    parser.add_argument("--video_directory", type=str, default="./video_outputs_wan21",
+                        help="Output directory for generated videos")
+    parser.add_argument("--prompt_list", type=str, default=None,
+                        help="JSON file; each item must have a 'prompt_en' field")
+    parser.add_argument("--teacache_thresh", type=float, default=0.2,
+                        help="TeaCache threshold (0.1≈2x speedup, 0.2≈3x)")
+    parser.add_argument("--loop", type=int, default=5,
+                        help="Videos per prompt; only the first uses Nirvana cache")
+    parser.add_argument("--eval_mode", action="store_true",
+                        help="Submit all prompts immediately (no request-rate simulation)")
+    parser.add_argument("--no_nirvana", action="store_true",
+                        help="Disable Nirvana cache (A/B baseline comparison)")
+    parser.add_argument("--log_file", type=str,
+                        default="request_throughput_wan21_nirvana.csv",
+                        help="Throughput CSV log path")
+    parser.add_argument("--num_workers", type=int, default=None,
+                        help="Worker processes (default: one per GPU)")
     args = parser.parse_args()
 
     os.makedirs(args.video_directory, exist_ok=True)
     num_gpus = torch.cuda.device_count()
     if num_gpus == 0:
-        raise RuntimeError("No CUDA devices")
-    num_workers = args.num_workers if args.num_workers is not None else num_gpus
-    num_workers = min(num_workers, num_gpus)
+        raise RuntimeError("No CUDA devices found")
+    num_workers = min(args.num_workers or num_gpus, num_gpus)
 
-    # Prompts (same as opensora: read_prompt_list uses prompt_en from JSON)
     if args.prompt_list and os.path.isfile(args.prompt_list):
         prompts = read_prompt_list(args.prompt_list)
         if args.num_req is not None:
             prompts = prompts[: args.num_req]
     else:
-        num_req = args.num_req if args.num_req is not None else 50
+        num_req = args.num_req or 50
         prompts = [
-            "A cat walking on the street.",
-            "Ocean waves under sunset.",
-            "A dog running in the park.",
+            "Two cats playing in the garden.",
+            "Ocean waves crashing at sunset.",
+            "A dog running through a snowy field.",
         ] * max(1, (num_req + 2) // 3)
         prompts = prompts[:num_req]
 
-    # Request schedule
     seconds_from_start = generate_rapidly_increasing_seconds_from_start(
         len(prompts), min_rate=0.5, max_rate=4
     )
@@ -477,14 +664,10 @@ def main():
         {"prompt": prompts, "seconds_from_start": seconds_from_start}
     )
 
-    # Empty initial cache
-    # Bug 4 fix: IndexFlatIP + L2-normalized embeddings → inner product == cosine similarity,
-    # so FAISS nearest-neighbour is consistent with the cosine threshold decisions.
-    embedding_dim = 768
-    index = faiss.IndexFlatIP(embedding_dim)
+    embedding_dim         = 768
+    index                 = faiss.IndexFlatIP(embedding_dim)
     final_text_embeddings = np.zeros((0, embedding_dim), dtype=np.float32)
-    cached_requests = []
-    # KMinHeapCache with empty initial state and k_values [5, 10, 15]
+    cached_requests       = []
     cache = KMinHeapCache(
         max_size=args.cache_size * len(K_VALUES_VIDEO),
         initial_embeddings=final_text_embeddings,
@@ -492,42 +675,31 @@ def main():
         k_values=K_VALUES_VIDEO,
     )
 
-    req_queue = mp.Queue()
+    req_queue       = mp.Queue()
     new_cache_queue = mp.Queue()
-    latency_queue = mp.Queue()
-    manager = mp.Manager()
-    worker_status = manager.dict()
-    cache_stats = manager.dict()
-    cache_stats["hits"] = 0
-    cache_stats["misses"] = 0
-    # Bug 3 fix: event lets scheduler notify workers to exit cleanly when done.
-    done_event = manager.Event()
+    latency_queue   = mp.Queue()
+    manager         = mp.Manager()
+    worker_status   = manager.dict()
+    cache_stats     = manager.dict({"hits": 0, "misses": 0})
+    done_event      = manager.Event()
 
     clip_model_name = "openai/clip-vit-large-patch14"
     clip_device     = "cuda:0" if torch.cuda.is_available() else "cpu"
 
     wall_start = time.time()
-    scheduler = mp.Process(
+    scheduler  = mp.Process(
         target=request_scheduler_video,
         args=(
-            req_queue,
-            selected_requests,
-            wall_start,
-            index,
-            cache,
-            new_cache_queue,
-            cached_requests,
-            final_text_embeddings,
-            K_VALUES_VIDEO,
-            clip_model_name,
-            clip_device,
-            worker_status,
-            done_event,
+            req_queue, selected_requests, wall_start,
+            index, cache, new_cache_queue, cached_requests,
+            final_text_embeddings, K_VALUES_VIDEO,
+            clip_model_name, clip_device,
+            worker_status, done_event,
         ),
         kwargs={
-            "log_file": args.log_file,
-            "eval_mode": args.eval_mode,
-            "no_nirvana": args.no_nirvana,
+            "log_file":    args.log_file,
+            "eval_mode":   args.eval_mode,
+            "no_nirvana":  args.no_nirvana,
             "cache_stats": cache_stats,
         },
     )
@@ -539,32 +711,24 @@ def main():
         p = mp.Process(
             target=worker_video,
             args=(
-                gpu_id,
-                req_queue,
-                new_cache_queue,
-                latency_queue,
-                worker_status,
-                args.video_directory,
-                args.resolution,
-                args.aspect_ratio,
-                args.num_frames,
-                args.teacache_thresh,
-                done_event,
-                args.loop,
-                args.no_nirvana,
+                gpu_id, req_queue, new_cache_queue, latency_queue,
+                worker_status, args.video_directory,
+                args.ckpt_dir, args.task, args.size,
+                args.frame_num, args.sampling_steps, args.guide_scale, args.shift,
+                args.teacache_thresh, done_event,
+                args.loop, args.no_nirvana, args.offload_model, args.use_ret_steps,
             ),
         )
         p.start()
         workers.append(p)
 
-    total_requests = len(prompts)
-    all_latencies = []
+    all_latencies        = []
     all_processing_times = []
-    with tqdm(total=total_requests, desc="Requests", unit="req") as pbar:
-        for _ in range(total_requests):
-            finish_time, pure_processing_time = latency_queue.get()
+    with tqdm(total=len(prompts), desc="Requests", unit="req") as pbar:
+        for _ in range(len(prompts)):
+            finish_time, proc_time = latency_queue.get()
             all_latencies.append(finish_time)
-            all_processing_times.append(pure_processing_time)
+            all_processing_times.append(proc_time)
             pbar.update(1)
 
     for p in workers:
@@ -575,18 +739,24 @@ def main():
     print(f"[Total wall time] {wall_total:.2f}s")
     if all_latencies:
         print(
-            f"[Per-request latency] min={min(all_latencies):.2f}s max={max(all_latencies):.2f}s avg={np.mean(all_latencies):.2f}s (n={len(all_latencies)})"
+            f"[Per-request latency]  "
+            f"min={min(all_latencies):.2f}s  "
+            f"max={max(all_latencies):.2f}s  "
+            f"avg={np.mean(all_latencies):.2f}s  "
+            f"(n={len(all_latencies)})"
         )
     if all_processing_times:
         print(
-            f"[Pure processing time] min={min(all_processing_times):.2f}s max={max(all_processing_times):.2f}s avg={np.mean(all_processing_times):.2f}s (n={len(all_processing_times)})"
+            f"[Pure processing time] "
+            f"min={min(all_processing_times):.2f}s  "
+            f"max={max(all_processing_times):.2f}s  "
+            f"avg={np.mean(all_processing_times):.2f}s"
         )
-    hits = cache_stats.get("hits", 0)
+    hits   = cache_stats.get("hits",   0)
     misses = cache_stats.get("misses", 0)
-    total_cache_requests = hits + misses
-    if total_cache_requests > 0:
-        hit_rate_pct = 100.0 * hits / total_cache_requests
-        print(f"[Cache hit rate] {hits}/{total_cache_requests} = {hit_rate_pct:.1f}%")
+    total  = hits + misses
+    if total > 0:
+        print(f"[Cache hit rate] {hits}/{total} = {100.0 * hits / total:.1f}%")
     elif args.no_nirvana:
         print("[Cache hit rate] N/A (Nirvana disabled)")
 

@@ -1,156 +1,161 @@
 # TeaCache Video Serving (Nirvana-Style Cross-Request Latent Reuse)
 
-This document describes how to run **TeaCache video pipeline + Nirvana-style cross-request latent cache**: CLIP similarity + FAISS to find similar prompts, reuse or write video latents at steps 5/10/15, with KMinHeapCache eviction and multi-GPU workers.
+Combines **TeaCache** (skip redundant transformer steps within a request) and **Nirvana** (reuse intermediate latents across similar requests) on top of **Wan2.1 T2V**.
 
 ---
 
-## Environment and Dependencies
-
-- **Python**: 3.8+ recommended
-- **CUDA**: Match your PyTorch version
-- Install project dependencies (see `requirements.txt`) and additionally:
-  - `faiss-cpu` or `faiss-gpu` (vector search)
-  - `pandas` (for request scheduling)
+## Dependencies
 
 ```bash
-# If not already installed
-pip install faiss-cpu pandas
-# Or FAISS with GPU
-pip install faiss-gpu pandas
+pip install faiss-cpu pandas transformers torch
+# or GPU FAISS:
+pip install faiss-gpu pandas transformers torch
 ```
 
+Also requires the `wan` package and a Wan2.1 checkpoint directory.
+
 ---
 
-## How to Run
-
-**Run from the project root** so that `videosys`, `eval.teacache`, `serving_system_N`, etc. are importable:
+## Quick Start
 
 ```bash
-cd /path/to/TeaCache
-python serving_system_video_teacache.py [options]
+python serving_system_video_teacache.py \
+    --ckpt_dir ./Wan2.1-T2V-14B \
+    --task t2v-14B \
+    --size 832*480 \
+    --num_req 50
 ```
 
 ---
 
 ## Arguments
 
-| Argument | Type | Default | Description |
-|----------|------|---------|-------------|
-| `--num_req` | int | None | Max prompts to process (default: all when `--prompt_list` given, else 50). |
-| `--cache_size` | int | 1000 | Max number of cached *requests* (each stores 3 steps 5/10/15; total cache entries = cache_size × 3). |
-| `--video_directory` | str | `./video_outputs_teacache` | Directory to save generated videos (same role as opensora `output_dir`). |
-| `--prompt_list` | str | None | JSON path; uses same `read_prompt_list` as opensora (`prompt_en`). |
-| `--resolution` | str | 480p | Output resolution. |
-| `--aspect_ratio` | str | 9:16 | Aspect ratio (e.g. 16:9, 1:1). |
-| `--num_frames` | int | 51 | Number of video frames. |
-| `--teacache_thresh` | float | 0.2 | TeaCache `rel_l1_thresh` (same as opensora teacache_fast). |
-| `--loop` | int | 5 | Videos per prompt (same as opensora eval); only the first uses Nirvana cache. |
-| `--eval_mode` | flag | False | No request timing: submit all prompts at once, run as fast as possible (like opensora eval). |
-| `--no_nirvana` | flag | False | Disable cache: every request does full 30-step generation (for A/B time comparison). |
+| Argument | Default | Description |
+|---|---|---|
+| `--ckpt_dir` | **(required)** | Wan2.1 checkpoint directory |
+| `--task` | `t2v-14B` | Task name: `t2v-14B` or `t2v-1.3B` |
+| `--size` | `832*480` | Resolution `W*H` (e.g. `1280*720`, `832*480`, `480*832`) |
+| `--frame_num` | `81` | Frames per video (must be `4n+1`) |
+| `--sampling_steps` | `50` | Diffusion denoising steps |
+| `--guide_scale` | `5.0` | Classifier-free guidance scale |
+| `--shift` | `5.0` | Flow-matching noise schedule shift |
+| `--use_ret_steps` | False | Use retention steps (better quality, slight speed trade-off) |
+| `--offload_model` | True | Offload weights to CPU between steps to save VRAM |
+| `--teacache_thresh` | `0.2` | Skip threshold (`0.1` ≈ 2× speedup, `0.2` ≈ 3×) |
+| `--num_req` | None | Max prompts (default: all from `--prompt_list`, else 50) |
+| `--loop` | `5` | Videos per prompt; only the first uses Nirvana cache |
+| `--cache_size` | `1000` | Max cached requests (stores latents at steps 5/10/15; total entries = `cache_size × 3`) |
+| `--video_directory` | `./video_outputs_wan21` | Output directory |
+| `--prompt_list` | None | JSON file with `prompt_en` field per item (VBench format) |
+| `--eval_mode` | False | Submit all prompts immediately, no request-rate simulation |
+| `--no_nirvana` | False | Disable Nirvana cache (A/B baseline) |
+| `--log_file` | `request_throughput_wan21_nirvana.csv` | Per-minute throughput CSV log |
+| `--num_workers` | None | Worker processes (default: one per GPU) |
 
 ---
 
-## Run Examples
+## Examples
 
-### 1. Same flow as opensora eval (VBench + Nirvana)
-
-```bash
-python serving_system_video_teacache.py \
-  --prompt_list eval/teacache/vbench/VBench_full_info.json \
-  --video_directory ./samples/opensora_teacache_nirvana \
-  --eval_mode
-```
-
-- Same prompt list as opensora (`read_prompt_list` → `prompt_en`), loop=5, output `{prompt}-{l}.mp4`, no request timing (`--eval_mode`). Nirvana cache is the only addition.
-
-### 1b. Quick run (default prompts, 50 requests)
-
-```bash
-python serving_system_video_teacache.py --num_req 50 --video_directory ./video_outputs_teacache
-```
-
-- Uses 3 built-in prompts; 50 requests, 5 videos each (default loop=5). Naming: `{prompt}-0.mp4` … `{prompt}-4.mp4`.
-
-### 2. VBench, first 20 prompts, 500 cache entries
+### 1. Minimal run (built-in prompts, 14B model)
 
 ```bash
 python serving_system_video_teacache.py \
-  --num_req 20 \
-  --prompt_list eval/teacache/vbench/VBench_full_info.json \
-  --cache_size 500 \
-  --video_directory ./vbench_teacache_out
+    --ckpt_dir ./Wan2.1-T2V-14B \
+    --task t2v-14B \
+    --num_req 20
 ```
 
-- Same `read_prompt_list` as opensora; runs first 20 prompts, 5 videos each; cache holds up to 500 requests’ latents.
-
-### 3. Small cache (faster)
+### 2. VBench prompt list, eval mode, 480p
 
 ```bash
 python serving_system_video_teacache.py \
-  --num_req 10 \
-  --cache_size 200 \
-  --video_directory ./fast_out
+    --ckpt_dir ./Wan2.1-T2V-14B \
+    --task t2v-14B \
+    --size 832*480 \
+    --prompt_list eval/teacache/vbench/VBench_full_info.json \
+    --video_directory ./samples/wan21_nirvana \
+    --eval_mode
 ```
 
-- Fewer requests and smaller cache; good for debugging or latency tests.
-
-### 4. Custom resolution and frame count
+### 3. 1.3B model, 720p, retention steps
 
 ```bash
 python serving_system_video_teacache.py \
-  --num_req 30 \
-  --resolution 360p \
-  --aspect_ratio 16:9 \
-  --num_frames 33 \
-  --video_directory ./custom_out
+    --ckpt_dir ./Wan2.1-T2V-1.3B \
+    --task t2v-1.3B \
+    --size 1280*720 \
+    --teacache_thresh 0.1 \
+    --use_ret_steps \
+    --num_req 50 \
+    --video_directory ./samples/wan21_1.3b_nirvana
 ```
 
-- All requests use the same resolution, aspect ratio, and frame count (consistent with the cache policy).
+### 4. A/B comparison: Nirvana on vs. off
+
+```bash
+# With Nirvana
+python serving_system_video_teacache.py \
+    --ckpt_dir ./Wan2.1-T2V-14B \
+    --task t2v-14B \
+    --prompt_list eval/teacache/vbench/VBench_full_info.json \
+    --num_req 20 --eval_mode \
+    --video_directory ./out_with_nirvana
+
+# Without Nirvana
+python serving_system_video_teacache.py \
+    --ckpt_dir ./Wan2.1-T2V-14B \
+    --task t2v-14B \
+    --prompt_list eval/teacache/vbench/VBench_full_info.json \
+    --num_req 20 --eval_mode --no_nirvana \
+    --video_directory ./out_no_nirvana
+```
+
+Compare **Total wall time** and **Per-request latency (avg)** printed at the end.
 
 ---
 
-## Behavior Overview
+## How It Works
 
-- **Scheduler process**: Dispatches requests by timestamp; encodes each prompt with CLIP and uses FAISS to find the nearest cached prompt; if similarity > 0.65, selects a step tier (0.95→step 15, 0.85→step 10, 0.65→step 5), retrieves the corresponding latent from KMinHeapCache and sends it with the request to a worker; otherwise marks as cache miss.
-- **Worker process** (one per GPU): Loads Open-Sora + TeaCache (`teacache_forward`).  
-  - **Miss**: Runs full 30-step generation, collects latents at steps 5/10/15, and pushes them with the CLIP embedding to `new_cache_queue`.  
-  - **Hit**: Uses `cache_latent` and `cache_start_step` (5/10/15) from the request to continue denoising from that step to the end.
-- **Cache**: KMinHeapCache with LCBFU eviction; k_values are fixed at `[5, 10, 15]`.
+**Scheduler process** — encodes each prompt with CLIP, queries FAISS for the nearest cached prompt. If cosine similarity > 0.65, selects a latent step tier and forwards the cached latent to a worker:
+
+| Similarity | Reuse from step |
+|---|---|
+| > 0.95 | 15 (skips 15/50 steps) |
+| > 0.85 | 10 |
+| > 0.65 | 5 |
+
+**Worker process** (one per GPU) — loads `wan.WanT2V` with:
+- `teacache_forward` — instance-level TeaCache (even/odd cond/uncond paths)
+- `t2v_generate_nirvana` — Nirvana-aware generate function
+
+On a **cache miss**: runs full denoising, snapshots latents at steps 5/10/15, enqueues them for the scheduler.  
+On a **cache hit**: injects the cached latent and resumes denoising from step 5, 10, or 15.
+
+**Cache** — `KMinHeapCache` with LCBFU eviction; stays aligned with FAISS via `remap_index_after_eviction`.
 
 ---
 
-## Output and Logs
+## Output
 
-- **Videos**: Saved under `--video_directory`; filenames include prompt and timestamp.
-- **Throughput log**: Written to `request_throughput_video_teacache.csv` in the current directory (timestamp, request_rate, throughput).
-- **Console**: Prints latency stats (min/max/avg in seconds) when finished.
+- **Videos**: `{video_directory}/{prompt}-{loop_idx}.mp4`
+- **Throughput log**: `--log_file` CSV (`timestamp, request_rate, throughput`)
+- **Console summary**:
+  ```
+  [Total wall time] 342.10s
+  [Per-request latency]  min=12.3s  max=89.4s  avg=34.2s  (n=50)
+  [Pure processing time] min=11.8s  max=88.1s  avg=33.7s
+  [Cache hit rate] 31/50 = 62.0%
+  ```
 
 ---
 
 ## FAQ
 
-1. **ModuleNotFoundError: No module named 'eval'**  
-   Run the script from the **project root** so the `eval` package is on the Python path.
+**ModuleNotFoundError: No module named 'wan'**  
+Run from the project root or install: `pip install -e .`
 
-2. **CUDA out of memory**  
-   Reduce `--num_frames` or `--resolution`, or use fewer workers (currently one per GPU).
+**CUDA out of memory**  
+Use `--offload_model` (on by default), reduce `--frame_num`, lower `--size`, or use the 1.3B model.
 
-3. **FAISS-related errors**  
-   Ensure `faiss-cpu` or `faiss-gpu` is installed and compatible with your Python/CUDA.
-
-4. **Comparing with vs without Nirvana (time)**
-
-   Run the same prompts twice and compare **Total wall time** and **Per-request latency (avg)**:
-
-   ```bash
-   # With Nirvana (cache enabled)
-   python serving_system_video_teacache.py --prompt_list eval/teacache/vbench/VBench_full_info.json --num_req 20 --video_directory ./out_with_nirvana --eval_mode
-
-   # Without Nirvana (every request full 30 steps)
-   python serving_system_video_teacache.py --prompt_list eval/teacache/vbench/VBench_full_info.json --num_req 20 --video_directory ./out_no_nirvana --eval_mode --no_nirvana
-   ```
-
-   Use different `--video_directory` so outputs don’t overwrite. With Nirvana, similar prompts can hit cache and run fewer steps (faster).
-
-5. **Changing k_values**  
-   The implementation uses [5, 10, 15] by default. To use other steps, edit `K_VALUES_VIDEO` in `serving_system_video_teacache.py` and the corresponding `collect_latents_at_steps` / `cache_start_step` in the pipeline and scheduler.
+**Multi-GPU**  
+One worker per GPU by default. Use `--num_workers N` to limit.
